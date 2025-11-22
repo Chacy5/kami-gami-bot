@@ -56,6 +56,28 @@ TASK_ICON_BY_DIFFICULTY = {
     "hard": "🔴",
 }
 
+DIFFICULTY_ORDER = {"easy": 0, "normal": 1, "hard": 2}
+
+TASK_REWARD_EMBLEMS = sorted({
+    emb
+    for entry in TASKS
+    for emb in (entry.get("reward_emblems") or entry.get("emblems") or {}).keys()
+})
+
+DEFAULT_TASK_FILTERS = {
+    "category": None,
+    "query": None,
+    "sort": "id",  # id | difficulty
+    "emblem": None,
+}
+
+DEFAULT_REWARD_FILTERS = {
+    "category": None,
+    "query": None,
+    "affordable_only": False,
+    "sort": "id",  # id | cost
+}
+
 USERS: Dict[int, Dict] = {}
 
 CURRENT_SEASON = 1
@@ -78,6 +100,16 @@ def task_reward_exp(task: Dict) -> int:
 def format_emblems(emblems: Dict[str, int]) -> str:
     return ", ".join(f"{emb} × {amt}" for emb, amt in emblems.items())
 
+def get_task_filters(user: Dict) -> Dict:
+    if "task_filters" not in user:
+        user["task_filters"] = DEFAULT_TASK_FILTERS.copy()
+    return user["task_filters"]
+
+def get_reward_filters(user: Dict) -> Dict:
+    if "reward_filters" not in user:
+        user["reward_filters"] = DEFAULT_REWARD_FILTERS.copy()
+    return user["reward_filters"]
+
 def get_user(user_id: int) -> Dict:
     if user_id not in USERS:
         USERS[user_id] = {
@@ -89,6 +121,8 @@ def get_user(user_id: int) -> Dict:
             "completed_tasks": [],
             "pinned_tasks": [],
             "version": 2,
+            "task_filters": DEFAULT_TASK_FILTERS.copy(),
+            "reward_filters": DEFAULT_REWARD_FILTERS.copy(),
         }
     return USERS[user_id]
 
@@ -159,18 +193,66 @@ def build_task_categories_kb() -> InlineKeyboardMarkup:
     kb.adjust(2)
     return kb.as_markup()
 
-def build_tasks_list_kb(category: Optional[str] = None, query: Optional[str] = None) -> InlineKeyboardMarkup:
+def summarize_task_filters(filters: Dict) -> str:
+    parts = []
+    if filters.get("category"):
+        parts.append(f"категория: {filters['category']}")
+    if filters.get("query"):
+        parts.append(f"поиск: «{filters['query']}»")
+    parts.append(f"сортировка: {'сложность' if filters.get('sort') == 'difficulty' else 'id'}")
+    parts.append(f"эмблема: {filters.get('emblem') or 'все'}")
+    return "; ".join(parts)
+
+def filtered_tasks(user: Dict) -> List[Dict]:
+    filters = get_task_filters(user)
+    items = TASKS
+    if filters.get("category"):
+        items = [t for t in items if t["category"] == filters["category"]]
+    if filters.get("query"):
+        q = filters["query"].lower()
+        items = [t for t in items if q in t["name"].lower() or q in t.get("description", "").lower()]
+    if filters.get("emblem"):
+        needed = filters["emblem"]
+        items = [t for t in items if needed in task_reward_emblems(t)]
+    if filters.get("sort") == "difficulty":
+        items = sorted(items, key=lambda t: (DIFFICULTY_ORDER.get(t.get("difficulty"), 99), t["id"]))
+    else:
+        items = sorted(items, key=lambda t: t["id"])
+    return items
+
+def build_tasks_list(user: Dict) -> tuple[str, InlineKeyboardMarkup]:
+    filters = get_task_filters(user)
+    tasks_list = filtered_tasks(user)
     kb = InlineKeyboardBuilder()
-    filtered = TASKS
-    if category and category != "all":
-        filtered = [t for t in TASKS if t["category"] == category]
-    if query:
-        q = query.lower()
-        filtered = [t for t in filtered if q in t["name"].lower() or q in t.get("description", "").lower()]
-    for t in filtered:
-        kb.button(text=f"{get_task_icon(t)} {t['name']}", callback_data=f"task_{t['id']}")
+    for t in tasks_list:
+        kb.button(text=f"{get_task_icon(t)} {t['name']}", callback_data=f"task_view_{t['id']}")
+    kb.button(
+        text=f"↕️ Сортировка: {'сложность' if filters.get('sort') == 'difficulty' else 'id'}",
+        callback_data="tasks_toggle_sort",
+    )
+    kb.button(
+        text=f"🎯 Эмблема: {filters.get('emblem') or 'все'}",
+        callback_data="tasks_filter_emblem_menu",
+    )
+    kb.button(text="♻️ Сбросить фильтры", callback_data="tasks_filters_reset")
     kb.button(text="⬅️ Категории", callback_data="menu_tasks")
     kb.adjust(1)
+    text_lines = [
+        "📜 Задания",
+        summarize_task_filters(filters),
+        "",
+        "Выбери задание из списка:",
+    ]
+    return "\n".join(text_lines), kb.as_markup()
+
+def build_task_emblem_filter_kb(current: Optional[str]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for emb in TASK_REWARD_EMBLEMS:
+        marker = "✓" if emb == current else " "
+        kb.button(text=f"{marker} {emb}", callback_data=f"tasks_set_emblem_{emb}")
+    kb.button(text="Показать все", callback_data="tasks_set_emblem_clear")
+    kb.button(text="⬅️ Назад к заданиям", callback_data="tasks_back_to_list")
+    kb.adjust(2)
     return kb.as_markup()
 
 def build_shop_categories_kb() -> InlineKeyboardMarkup:
@@ -184,43 +266,97 @@ def build_shop_categories_kb() -> InlineKeyboardMarkup:
     kb.adjust(2)
     return kb.as_markup()
 
-def build_rewards_list_kb(category: Optional[str] = None, query: Optional[str] = None) -> InlineKeyboardMarkup:
+def summarize_reward_filters(filters: Dict) -> str:
+    parts = []
+    if filters.get("category"):
+        parts.append(f"категория: {filters['category']}")
+    if filters.get("query"):
+        parts.append(f"поиск: «{filters['query']}»")
+    parts.append(f"доступные: {'да' if filters.get('affordable_only') else 'нет'}")
+    parts.append(f"сортировка: {'стоимость' if filters.get('sort') == 'cost' else 'id'}")
+    return "; ".join(parts)
+
+def filtered_rewards(user: Dict) -> List[Dict]:
+    filters = get_reward_filters(user)
+    items = REWARDS
+    if filters.get("category"):
+        items = [r for r in items if r["category"] == filters["category"]]
+    if filters.get("query"):
+        q = filters["query"].lower()
+        items = [r for r in items if q in r["name"].lower() or q in r.get("description", "").lower()]
+    if filters.get("affordable_only"):
+        def affordable(reward):
+            for emb, need in reward["cost"].items():
+                if user["emblems"].get(emb, 0) < need:
+                    return False
+            return True
+        items = [r for r in items if affordable(r)]
+    if filters.get("sort") == "cost":
+        items = sorted(items, key=lambda r: sum(r["cost"].values()))
+    else:
+        items = sorted(items, key=lambda r: r["id"])
+    return items
+
+def build_rewards_list(user: Dict) -> tuple[str, InlineKeyboardMarkup]:
+    filters = get_reward_filters(user)
+    rewards_list = filtered_rewards(user)
     kb = InlineKeyboardBuilder()
-    filtered = REWARDS
-    if category and category != "all":
-        filtered = [r for r in REWARDS if r["category"] == category]
-    if query:
-        q = query.lower()
-        filtered = [r for r in filtered if q in r["name"].lower() or q in r.get("description", "").lower()]
-    for r in filtered:
+    for r in rewards_list:
         kb.button(text=f"{r['emoji']} {r['name']}", callback_data=f"reward_{r['id']}")
+    kb.button(
+        text=f"✅ Доступные: {'вкл' if filters.get('affordable_only') else 'выкл'}",
+        callback_data="shop_toggle_affordable",
+    )
+    kb.button(
+        text=f"↕️ Сортировка: {'эмблемы' if filters.get('sort') == 'cost' else 'id'}",
+        callback_data="shop_toggle_sort",
+    )
+    kb.button(text="♻️ Сбросить фильтры", callback_data="shop_filters_reset")
     kb.button(text="⬅️ Категории", callback_data="menu_shop")
     kb.adjust(1)
-    return kb.as_markup()
+    text_lines = [
+        "🏆 Магазин наград",
+        summarize_reward_filters(filters),
+        "",
+        "Выбери награду из списка:",
+    ]
+    return "\n".join(text_lines), kb.as_markup()
 
 def build_bp_rewards_view(user: Dict) -> str:
     lines = [f"🎫 Боевой пропуск — сезон {CURRENT_SEASON}", season_time_left(), ""]
-    lines.append(get_bp_progress(user))
-    lines.append("")
     per_level = 50
+    lvl = user["bp_level"]
+    exp = user["exp"]
+    current_in_level = exp - (lvl - 1) * per_level if lvl < 50 else per_level
+    remaining_in_level = per_level - current_in_level if lvl < 50 else 0
+    if lvl >= 50:
+        lines.append("Уровень 50 • максимум.")
+    else:
+        filled = int((current_in_level / per_level) * 12)
+        bar = "█" * filled + "░" * (12 - filled)
+        lines.append(f"Уровень {lvl} • {current_in_level}/{per_level} XP до следующего")
+        lines.append(f"[{bar}] осталось {remaining_in_level} XP")
+    lines.append("")
+    lines.append("Награды:")
     for entry in BP_REWARDS:
-        lvl = entry["level"]
+        entry_lvl = entry["level"]
         reward_name = entry["name"]
         reward_desc = entry.get("description", "")
         emblem_text = format_emblems(entry.get("emblems", {}))
+        total_for_level = entry_lvl * per_level
+        need = max(total_for_level - exp, 0)
+        status = "✅" if entry_lvl <= lvl else "⏳" if entry_lvl == lvl + 1 else "·"
+        main = f"{status} {entry_lvl:>2} • {reward_name}"
+        if status != "✅":
+            main += f" — ещё {need} XP"
+        lines.append(main)
         detail_parts = []
         if reward_desc:
             detail_parts.append(reward_desc)
         if emblem_text:
             detail_parts.append(f"Эмблемы: {emblem_text}")
-        details = " — ".join(detail_parts) if detail_parts else ""
-        total_for_level = lvl * per_level
-        need = total_for_level - user["exp"]
-        if need < 0:
-            need = 0
-        mark = "✓" if lvl <= user["bp_level"] else "➤" if lvl == user["bp_level"] else "·"
-        suffix = f" — {details}" if details else ""
-        lines.append(f"{mark} Уровень {lvl}: {reward_name}{suffix} (нужно ещё {need} XP)")
+        if detail_parts:
+            lines.append("    " + " | ".join(detail_parts))
     return "\n".join(lines)
 
 def format_emblem_cost(user: Dict, cost: Dict[str, int]) -> str:
@@ -262,14 +398,12 @@ async def cb_menu_tasks(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("tasks_cat_"))
 async def cb_tasks_cat(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
     cat = callback.data.removeprefix("tasks_cat_")
-    if cat == "all":
-        cat = None
-    kb = build_tasks_list_kb(category=cat)
-    await callback.message.edit_text(
-        "Выбери задание из списка:",
-        reply_markup=kb
-    )
+    filters = get_task_filters(user)
+    filters["category"] = None if cat == "all" else cat
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data == "tasks_search")
@@ -282,26 +416,74 @@ async def cb_tasks_search(callback: CallbackQuery):
     user["awaiting_task_search"] = True
     await callback.answer()
 
+@router.callback_query(F.data == "tasks_toggle_sort")
+async def cb_tasks_toggle_sort(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    filters = get_task_filters(user)
+    filters["sort"] = "difficulty" if filters.get("sort") != "difficulty" else "id"
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer("Сортировка обновлена.")
+
+@router.callback_query(F.data == "tasks_filters_reset")
+async def cb_tasks_filters_reset(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    user["task_filters"] = DEFAULT_TASK_FILTERS.copy()
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer("Фильтры сброшены.")
+
+@router.callback_query(F.data == "tasks_filter_emblem_menu")
+async def cb_tasks_filter_emblem_menu(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    current = get_task_filters(user).get("emblem")
+    kb = build_task_emblem_filter_kb(current)
+    await callback.message.edit_text(
+        "🎯 Фильтр по эмблемам.\nВыбери эмблему, чтобы оставить задания с этой наградой.",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "tasks_set_emblem_clear")
+async def cb_tasks_set_emblem_clear(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    get_task_filters(user)["emblem"] = None
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer("Фильтр снят.")
+
+@router.callback_query(F.data.startswith("tasks_set_emblem_"))
+async def cb_tasks_set_emblem(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    emb = callback.data.removeprefix("tasks_set_emblem_")
+    get_task_filters(user)["emblem"] = emb
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer(f"Эмблема {emb}")
+
+@router.callback_query(F.data == "tasks_back_to_list")
+async def cb_tasks_back_to_list(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
 @router.message()
 async def any_text(message: Message):
     user = get_user(message.from_user.id)
     if user.get("awaiting_task_search"):
         query = message.text.strip()
         user["awaiting_task_search"] = False
-        kb = build_tasks_list_kb(query=query)
-        await message.answer(
-            f"Результаты поиска по заданиям для: <b>{query}</b>",
-            reply_markup=kb
-        )
+        get_task_filters(user)["query"] = query
+        text, kb = build_tasks_list(user)
+        await message.answer(text, reply_markup=kb)
         return
     if user.get("awaiting_shop_search"):
         query = message.text.strip()
         user["awaiting_shop_search"] = False
-        kb = build_rewards_list_kb(query=query)
-        await message.answer(
-            f"Результаты поиска по наградам для: <b>{query}</b>",
-            reply_markup=kb
-        )
+        get_reward_filters(user)["query"] = query
+        text, kb = build_rewards_list(user)
+        await message.answer(text, reply_markup=kb)
         return
     await message.answer(
         "Я пока понимаю только команды меню.\n"
@@ -309,10 +491,10 @@ async def any_text(message: Message):
         reply_markup=build_main_menu()
     )
 
-@router.callback_query(F.data.startswith("task_"))
+@router.callback_query(F.data.startswith("task_view_"))
 async def cb_task_detail(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
-    tid = int(callback.data.removeprefix("task_"))
+    tid = int(callback.data.removeprefix("task_view_"))
     task = next((t for t in TASKS if t["id"] == tid), None)
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
@@ -378,14 +560,12 @@ async def cb_menu_shop(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("shop_cat_"))
 async def cb_shop_cat(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
     cat = callback.data.removeprefix("shop_cat_")
-    if cat == "all":
-        cat = None
-    kb = build_rewards_list_kb(category=cat)
-    await callback.message.edit_text(
-        "Выбери награду из списка:",
-        reply_markup=kb
-    )
+    filters = get_reward_filters(user)
+    filters["category"] = None if cat == "all" else cat
+    text, kb = build_rewards_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data == "shop_search")
@@ -397,6 +577,32 @@ async def cb_shop_search(callback: CallbackQuery):
         "Просто отправь мне сообщение.",
     )
     await callback.answer()
+
+@router.callback_query(F.data == "shop_toggle_affordable")
+async def cb_shop_toggle_affordable(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    filters = get_reward_filters(user)
+    filters["affordable_only"] = not filters.get("affordable_only")
+    text, kb = build_rewards_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer("Фильтр доступных обновлён.")
+
+@router.callback_query(F.data == "shop_toggle_sort")
+async def cb_shop_toggle_sort(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    filters = get_reward_filters(user)
+    filters["sort"] = "cost" if filters.get("sort") != "cost" else "id"
+    text, kb = build_rewards_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer("Сортировка обновлена.")
+
+@router.callback_query(F.data == "shop_filters_reset")
+async def cb_shop_filters_reset(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    user["reward_filters"] = DEFAULT_REWARD_FILTERS.copy()
+    text, kb = build_rewards_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer("Фильтры сброшены.")
 
 @router.callback_query(F.data.startswith("reward_"))
 async def cb_reward_detail(callback: CallbackQuery):
