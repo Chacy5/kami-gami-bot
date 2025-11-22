@@ -85,6 +85,10 @@ SEASON_DURATION_DAYS = 28
 SEASON_START_DATE = datetime.utcnow()
 SEASON_END_DATE = SEASON_START_DATE + timedelta(days=SEASON_DURATION_DAYS)
 
+MAX_LVL = 50
+BASE_XP = 50        # первый уровень
+GROWTH = 1.03       # рост сложности 3% — идеально на сезон ~27 дней
+
 def get_task_icon(task: Dict) -> str:
     return TASK_ICON_BY_CATEGORY.get(
         task.get("category"),
@@ -99,6 +103,31 @@ def task_reward_exp(task: Dict) -> int:
 
 def format_emblems(emblems: Dict[str, int]) -> str:
     return ", ".join(f"{emb} × {amt}" for emb, amt in emblems.items())
+
+def xp_for_level(level: int) -> int:
+    """XP для перехода с этого уровня на следующий."""
+    return int(BASE_XP * (GROWTH ** (level - 1)))
+
+def total_xp_for_level(level: int) -> int:
+    """Сколько XP нужно всего до конца указанного уровня."""
+    if level <= 0:
+        return 0
+    return sum(xp_for_level(i) for i in range(1, level + 1))
+
+def get_bp_progress(user: Dict) -> str:
+    lvl = user["bp_level"]
+    exp = user["exp"]
+
+    if lvl >= MAX_LVL:
+        return f"Боевой пропуск: уровень {MAX_LVL} (максимум)."
+
+    current_total = total_xp_for_level(lvl - 1)
+    next_total = total_xp_for_level(lvl)
+
+    in_level = exp - current_total
+    need_in_level = next_total - current_total
+
+    return f"Боевой пропуск: уровень {lvl} — {in_level}/{need_in_level} XP до следующего уровня."
 
 def get_task_filters(user: Dict) -> Dict:
     if "task_filters" not in user:
@@ -126,33 +155,49 @@ def get_user(user_id: int) -> Dict:
         }
     return USERS[user_id]
 
+MAX_LVL = 50
+BASE_XP = 50        # первый уровень
+GROWTH = 1.03       # рост сложности 3% — идеально на сезон 27 дней
+
+def xp_for_level(level: int) -> int:
+    """XP для перехода С ЭТОГО уровня на следующий"""
+    return int(BASE_XP * (GROWTH ** (level - 1)))
+
+def total_xp_for_level(level: int) -> int:
+    """Сколько XP нужно всего до конца уровня"""
+    if level <= 0:
+        return 0
+    return sum(xp_for_level(i) for i in range(1, level + 1))
+
 def get_bp_progress(user: Dict) -> str:
     lvl = user["bp_level"]
     exp = user["exp"]
-    per_level = 50
-    next_level_exp = lvl * per_level
-    current_level_exp = (lvl - 1) * per_level
-    in_level = exp - current_level_exp
-    need_in_level = next_level_exp - current_level_exp
-    if lvl >= 50:
-        return "Боевой пропуск: уровень 50 (максимум)."
+
+    if lvl >= MAX_LVL:
+        return f"Боевой пропуск: уровень {MAX_LVL} (максимум)."
+
+    current_total = total_xp_for_level(lvl - 1)
+    next_total = total_xp_for_level(lvl)
+
+    in_level = exp - current_total
+    need_in_level = next_total - current_total
+
     return f"Боевой пропуск: уровень {lvl} — {in_level}/{need_in_level} XP до следующего уровня."
+
 
 def add_exp(user: Dict, amount: int) -> List[Dict]:
     rewards = []
     user["exp"] += amount
-    per_level = 50
-    while user["bp_level"] < 50:
-        next_level_total = user["bp_level"] * per_level
-        if user["exp"] >= next_level_total:
-            user["bp_level"] += 1
-            for r in BP_REWARDS:
-                if r["level"] == user["bp_level"]:
-                    rewards.append(r)
-                    for emb, amt in r.get("emblems", {}).items():
-                        user["emblems"][emb] = user["emblems"].get(emb, 0) + amt
-        else:
+    while user["bp_level"] < MAX_LVL:
+        next_level_total = total_xp_for_level(user["bp_level"])
+        if user["exp"] < next_level_total:
             break
+        user["bp_level"] += 1
+        for r in BP_REWARDS:
+            if r["level"] == user["bp_level"]:
+                rewards.append(r)
+                for emb, amt in r.get("emblems", {}).items():
+                    user["emblems"][emb] = user["emblems"].get(emb, 0) + amt
     return rewards
 
 def season_time_left() -> str:
@@ -324,17 +369,19 @@ def build_rewards_list(user: Dict) -> tuple[str, InlineKeyboardMarkup]:
 
 def build_bp_rewards_view(user: Dict) -> str:
     lines = [f"🎫 Боевой пропуск — сезон {CURRENT_SEASON}", season_time_left(), ""]
-    per_level = 50
     lvl = user["bp_level"]
     exp = user["exp"]
-    current_in_level = exp - (lvl - 1) * per_level if lvl < 50 else per_level
-    remaining_in_level = per_level - current_in_level if lvl < 50 else 0
-    if lvl >= 50:
+    current_total = total_xp_for_level(lvl - 1)
+    next_total = total_xp_for_level(lvl)
+    need_in_level = next_total - current_total
+    current_in_level = exp - current_total if lvl < MAX_LVL else need_in_level
+    remaining_in_level = max(need_in_level - current_in_level, 0) if lvl < MAX_LVL else 0
+    if lvl >= MAX_LVL:
         lines.append("Уровень 50 • максимум.")
     else:
-        filled = int((current_in_level / per_level) * 12)
-        bar = "█" * filled + "░" * (12 - filled)
-        lines.append(f"Уровень {lvl} • {current_in_level}/{per_level} XP до следующего")
+        filled = int((current_in_level / need_in_level) * 12) if need_in_level else 12
+        bar = "█" * min(filled, 12) + "░" * (12 - min(filled, 12))
+        lines.append(f"Уровень {lvl} • {current_in_level}/{need_in_level} XP до следующего")
         lines.append(f"[{bar}] осталось {remaining_in_level} XP")
     lines.append("")
     lines.append("Награды:")
@@ -343,7 +390,7 @@ def build_bp_rewards_view(user: Dict) -> str:
         reward_name = entry["name"]
         reward_desc = entry.get("description", "")
         emblem_text = format_emblems(entry.get("emblems", {}))
-        total_for_level = entry_lvl * per_level
+        total_for_level = total_xp_for_level(entry_lvl)
         need = max(total_for_level - exp, 0)
         status = "✅" if entry_lvl <= lvl else "⏳" if entry_lvl == lvl + 1 else "·"
         main = f"{status} {entry_lvl:>2} • {reward_name}"
