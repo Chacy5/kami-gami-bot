@@ -23,6 +23,39 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 
 router = Router()
 
+ALL_EMBLEMS = sorted({
+    emb
+    for entry in TASKS
+    for emb in entry.get("emblems", {}).keys()
+} | {
+    emb
+    for reward in REWARDS
+    for emb in reward.get("cost", {}).keys()
+})
+
+TASK_ICON_BY_CATEGORY = {
+    "selfcare": "💆",
+    "cleaning": "🧹",
+    "dog": "🐕",
+    "finance": "💰",
+    "admin": "📋",
+    "work": "💻",
+    "together": "🤝",
+    "hobby": "🎲",
+    "mixed": "🌀",
+    "home": "🏠",
+    "errands": "🛒",
+    "mtg": "🃏",
+    "music": "🎵",
+    "cooking": "🍳",
+}
+
+TASK_ICON_BY_DIFFICULTY = {
+    "easy": "🟢",
+    "normal": "🟡",
+    "hard": "🔴",
+}
+
 USERS: Dict[int, Dict] = {}
 
 CURRENT_SEASON = 1
@@ -30,16 +63,26 @@ SEASON_DURATION_DAYS = 28
 SEASON_START_DATE = datetime.utcnow()
 SEASON_END_DATE = SEASON_START_DATE + timedelta(days=SEASON_DURATION_DAYS)
 
+def get_task_icon(task: Dict) -> str:
+    return TASK_ICON_BY_CATEGORY.get(
+        task.get("category"),
+        TASK_ICON_BY_DIFFICULTY.get(task.get("difficulty"), "🗒️"),
+    )
+
+def task_reward_emblems(task: Dict) -> Dict[str, int]:
+    return task.get("reward_emblems") or task.get("emblems") or {}
+
+def task_reward_exp(task: Dict) -> int:
+    return task.get("reward_exp") or task.get("xp") or 0
+
+def format_emblems(emblems: Dict[str, int]) -> str:
+    return ", ".join(f"{emb} × {amt}" for emb, amt in emblems.items())
+
 def get_user(user_id: int) -> Dict:
     if user_id not in USERS:
         USERS[user_id] = {
             "id": user_id,
-            "emblems": {emb: 0 for emb in [
-                "𓂀", "✶", "℘", "✦", "☾",
-                "✺", "♖", "✣", "𓍝", "✧",
-                "⚑", "✥", "✢", "♆", "✺",
-                "⚙", "♜", "✶", "♧", "✹"
-            ]},
+            "emblems": {emb: 0 for emb in ALL_EMBLEMS},
             "exp": 0,
             "bp_level": 1,
             "bp_exp_to_next": 50,
@@ -72,6 +115,8 @@ def add_exp(user: Dict, amount: int) -> List[Dict]:
             for r in BP_REWARDS:
                 if r["level"] == user["bp_level"]:
                     rewards.append(r)
+                    for emb, amt in r.get("emblems", {}).items():
+                        user["emblems"][emb] = user["emblems"].get(emb, 0) + amt
         else:
             break
     return rewards
@@ -123,7 +168,7 @@ def build_tasks_list_kb(category: Optional[str] = None, query: Optional[str] = N
         q = query.lower()
         filtered = [t for t in filtered if q in t["name"].lower() or q in t.get("description", "").lower()]
     for t in filtered:
-        kb.button(text=f"{t['emoji']} {t['name']}", callback_data=f"task_{t['id']}")
+        kb.button(text=f"{get_task_icon(t)} {t['name']}", callback_data=f"task_{t['id']}")
     kb.button(text="⬅️ Категории", callback_data="menu_tasks")
     kb.adjust(1)
     return kb.as_markup()
@@ -162,12 +207,20 @@ def build_bp_rewards_view(user: Dict) -> str:
         lvl = entry["level"]
         reward_name = entry["name"]
         reward_desc = entry.get("description", "")
+        emblem_text = format_emblems(entry.get("emblems", {}))
+        detail_parts = []
+        if reward_desc:
+            detail_parts.append(reward_desc)
+        if emblem_text:
+            detail_parts.append(f"Эмблемы: {emblem_text}")
+        details = " — ".join(detail_parts) if detail_parts else ""
         total_for_level = lvl * per_level
         need = total_for_level - user["exp"]
         if need < 0:
             need = 0
         mark = "✓" if lvl <= user["bp_level"] else "➤" if lvl == user["bp_level"] else "·"
-        lines.append(f"{mark} Уровень {lvl}: {reward_name} — {reward_desc} (нужно ещё {need} XP)")
+        suffix = f" — {details}" if details else ""
+        lines.append(f"{mark} Уровень {lvl}: {reward_name}{suffix} (нужно ещё {need} XP)")
     return "\n".join(lines)
 
 def format_emblem_cost(user: Dict, cost: Dict[str, int]) -> str:
@@ -264,14 +317,16 @@ async def cb_task_detail(callback: CallbackQuery):
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
         return
+    emblems_reward = task_reward_emblems(task)
+    exp_reward = task_reward_exp(task)
     text = (
-        f"{task['emoji']} <b>{task['name']}</b>\n\n"
+        f"{get_task_icon(task)} <b>{task['name']}</b>\n\n"
         f"{task.get('description', '')}\n\n"
         f"Эмблемы за выполнение:\n"
     )
-    for emb, amt in task["reward_emblems"].items():
+    for emb, amt in emblems_reward.items():
         text += f"• {emb} × {amt}\n"
-    text += f"\nОпыт: +{task['reward_exp']} XP"
+    text += f"\nОпыт: +{exp_reward} XP"
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Отметить выполненным", callback_data=f"task_done_{tid}")
     kb.button(text="⬅️ К заданиям", callback_data="menu_tasks")
@@ -287,20 +342,28 @@ async def cb_task_done(callback: CallbackQuery):
     if not task:
         await callback.answer("Задание не найдено.", show_alert=True)
         return
-    for emb, amt in task["reward_emblems"].items():
+    emblems_reward = task_reward_emblems(task)
+    exp_reward = task_reward_exp(task)
+    for emb, amt in emblems_reward.items():
         user["emblems"][emb] = user["emblems"].get(emb, 0) + amt
-    level_rewards = add_exp(user, task["reward_exp"])
+    level_rewards = add_exp(user, exp_reward)
     text = (
         f"✅ Задание выполнено: <b>{task['name']}</b>\n\n"
         "Ты получил:\n"
     )
-    for emb, amt in task["reward_emblems"].items():
+    for emb, amt in emblems_reward.items():
         text += f"• {emb} × {amt}\n"
-    text += f"\nОпыт: +{task['reward_exp']} XP\n"
+    text += f"\nОпыт: +{exp_reward} XP\n"
     if level_rewards:
         text += "\n🎉 Повышение уровня боевого пропуска!\n"
         for r in level_rewards:
-            text += f"• Уровень {r['level']}: {r['name']}\n"
+            parts = [r["name"]]
+            if r.get("description"):
+                parts.append(r["description"])
+            emblem_bonus = format_emblems(r.get("emblems", {}))
+            if emblem_bonus:
+                parts.append(f"Эмблемы: {emblem_bonus}")
+            text += f"• Уровень {r['level']}: " + " — ".join(parts) + "\n"
     text += f"\n{get_bp_progress(user)}"
     await callback.message.edit_text(text, reply_markup=build_main_menu())
     await callback.answer()
