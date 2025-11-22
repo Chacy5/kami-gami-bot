@@ -104,6 +104,47 @@ def task_reward_exp(task: Dict) -> int:
 def format_emblems(emblems: Dict[str, int]) -> str:
     return ", ".join(f"{emb} × {amt}" for emb, amt in emblems.items())
 
+INLINE_BUTTON_TEXT_LIMIT = 64
+
+def format_emblems_short(emblems: Dict[str, int]) -> str:
+    if not emblems:
+        return "—"
+    return " ".join(f"{emb}×{amt}" for emb, amt in sorted(emblems.items()))
+
+def build_button_text(base: str, info: str, prefix: str = "") -> str:
+    """Собирает текст кнопки с учётом лимита Telegram (64 символа)."""
+    content = f"{prefix}{base}"
+    suffix = f" • {info}" if info else ""
+    if len(content) + len(suffix) <= INLINE_BUTTON_TEXT_LIMIT:
+        return content + suffix
+    # Trim base to fit limit, leave info intact.
+    available = max(INLINE_BUTTON_TEXT_LIMIT - len(prefix) - len(suffix) - 1, 0)
+    trimmed = base[:available].rstrip()
+    if trimmed:
+        return f"{prefix}{trimmed}…{suffix}"
+    return (content + suffix)[:INLINE_BUTTON_TEXT_LIMIT]
+
+def can_afford(user: Dict, reward: Dict) -> bool:
+    for emb, need in reward["cost"].items():
+        if user["emblems"].get(emb, 0) < need:
+            return False
+    return True
+
+def task_button_text(task: Dict) -> str:
+    base = f"{get_task_icon(task)} {task['name']}"
+    parts = [format_emblems_short(task_reward_emblems(task))]
+    exp = task_reward_exp(task)
+    if exp:
+        parts.append(f"+{exp}XP")
+    info = " ".join(parts)
+    return build_button_text(base, info)
+
+def reward_button_text(reward: Dict, user: Dict) -> str:
+    base = f"{reward['emoji']} {reward['name']}"
+    prefix = "🟢 " if can_afford(user, reward) else "⚪ "
+    info = format_emblems_short(reward["cost"])
+    return build_button_text(base, info, prefix=prefix)
+
 def xp_for_level(level: int) -> int:
     """XP для перехода с этого уровня на следующий."""
     return int(BASE_XP * (GROWTH ** (level - 1)))
@@ -270,7 +311,12 @@ def build_tasks_list(user: Dict) -> tuple[str, InlineKeyboardMarkup]:
     tasks_list = filtered_tasks(user)
     kb = InlineKeyboardBuilder()
     for t in tasks_list:
-        kb.button(text=f"{get_task_icon(t)} {t['name']}", callback_data=f"task_view_{t['id']}")
+        kb.button(text=task_button_text(t), callback_data=f"task_view_{t['id']}")
+    kb.button(text="🔍 Поиск", callback_data="tasks_search")
+    kb.button(
+        text=f"📂 Категория: {filters.get('category') or 'все'}",
+        callback_data="tasks_filter_category_menu",
+    )
     kb.button(
         text=f"↕️ Сортировка: {'сложность' if filters.get('sort') == 'difficulty' else 'id'}",
         callback_data="tasks_toggle_sort",
@@ -281,6 +327,7 @@ def build_tasks_list(user: Dict) -> tuple[str, InlineKeyboardMarkup]:
     )
     kb.button(text="♻️ Сбросить фильтры", callback_data="tasks_filters_reset")
     kb.button(text="⬅️ Категории", callback_data="menu_tasks")
+    kb.button(text="🏠 Главное меню", callback_data="back_main")
     kb.adjust(1)
     text_lines = [
         "📜 Задания",
@@ -297,6 +344,19 @@ def build_task_emblem_filter_kb(current: Optional[str]) -> InlineKeyboardMarkup:
         kb.button(text=f"{marker} {emb}", callback_data=f"tasks_set_emblem_{emb}")
     kb.button(text="Показать все", callback_data="tasks_set_emblem_clear")
     kb.button(text="⬅️ Назад к заданиям", callback_data="tasks_back_to_list")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def build_task_category_filter_kb(current: Optional[str]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    categories = sorted(set(t["category"] for t in TASKS))
+    marker_all = "✓" if not current else " "
+    kb.button(text=f"{marker_all} все", callback_data="tasks_set_category_all")
+    for cat in categories:
+        marker = "✓" if cat == current else " "
+        kb.button(text=f"{marker} {cat}", callback_data=f"tasks_set_category_{cat}")
+    kb.button(text="⬅️ Назад к заданиям", callback_data="tasks_back_to_list")
+    kb.button(text="🏠 Главное меню", callback_data="back_main")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -330,12 +390,7 @@ def filtered_rewards(user: Dict) -> List[Dict]:
         q = filters["query"].lower()
         items = [r for r in items if q in r["name"].lower() or q in r.get("description", "").lower()]
     if filters.get("affordable_only"):
-        def affordable(reward):
-            for emb, need in reward["cost"].items():
-                if user["emblems"].get(emb, 0) < need:
-                    return False
-            return True
-        items = [r for r in items if affordable(r)]
+        items = [r for r in items if can_afford(user, r)]
     if filters.get("sort") == "cost":
         items = sorted(items, key=lambda r: sum(r["cost"].values()))
     else:
@@ -347,7 +402,10 @@ def build_rewards_list(user: Dict) -> tuple[str, InlineKeyboardMarkup]:
     rewards_list = filtered_rewards(user)
     kb = InlineKeyboardBuilder()
     for r in rewards_list:
-        kb.button(text=f"{r['emoji']} {r['name']}", callback_data=f"reward_{r['id']}")
+        kb.button(
+            text=reward_button_text(r, user),
+            callback_data=f"reward_{r['id']}",
+        )
     kb.button(
         text=f"✅ Доступные: {'вкл' if filters.get('affordable_only') else 'выкл'}",
         callback_data="shop_toggle_affordable",
@@ -491,6 +549,17 @@ async def cb_tasks_filter_emblem_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
+@router.callback_query(F.data == "tasks_filter_category_menu")
+async def cb_tasks_filter_category_menu(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    current = get_task_filters(user).get("category")
+    kb = build_task_category_filter_kb(current)
+    await callback.message.edit_text(
+        "📂 Фильтр по категориям.\nВыбери категорию, чтобы сузить список заданий.",
+        reply_markup=kb
+    )
+    await callback.answer()
+
 @router.callback_query(F.data == "tasks_set_emblem_clear")
 async def cb_tasks_set_emblem_clear(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
@@ -507,6 +576,15 @@ async def cb_tasks_set_emblem(callback: CallbackQuery):
     text, kb = build_tasks_list(user)
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer(f"Эмблема {emb}")
+
+@router.callback_query(F.data.startswith("tasks_set_category_"))
+async def cb_tasks_set_category(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    cat = callback.data.removeprefix("tasks_set_category_")
+    get_task_filters(user)["category"] = None if cat == "all" else cat
+    text, kb = build_tasks_list(user)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer(f"Категория: {cat if cat != 'all' else 'все'}")
 
 @router.callback_query(F.data == "tasks_back_to_list")
 async def cb_tasks_back_to_list(callback: CallbackQuery):
@@ -558,7 +636,8 @@ async def cb_task_detail(callback: CallbackQuery):
     text += f"\nОпыт: +{exp_reward} XP"
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Отметить выполненным", callback_data=f"task_done_{tid}")
-    kb.button(text="⬅️ К заданиям", callback_data="menu_tasks")
+    kb.button(text="⬅️ К списку заданий", callback_data="tasks_back_to_list")
+    kb.button(text="🏠 Главное меню", callback_data="back_main")
     kb.adjust(1)
     await callback.message.edit_text(text, reply_markup=kb.as_markup())
     await callback.answer()
