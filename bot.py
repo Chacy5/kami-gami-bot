@@ -1,8 +1,9 @@
 import asyncio
 import json
 import os
-import random
 from pathlib import Path
+from collections import Counter
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
@@ -31,6 +32,38 @@ if not BOT_TOKEN:
 DATA_DIR = Path("./data")
 DATA_DIR.mkdir(exist_ok=True)
 USERS_FILE = DATA_DIR / "users.json"
+
+# Конец сезона (можешь поменять под себя)
+SEASON_END = datetime(2026, 1, 31)  # ГГГГ, ММ, ДД
+
+# Сколько RP нужно для 1 уровня BP
+RP_PER_LEVEL = 5
+
+# Эмодзи для эмблем
+TOKEN_EMOJI = {
+    "HYDR": "💧",
+    "HEART": "❤️",
+    "HARM": "🧠",
+    "ORDER": "🧱",
+    "CLEAN": "🧼",
+    "MOTION": "🚶",
+    "STUDY": "📚",
+    "PLAN": "📅",
+    "LOG": "📝",
+    "R-LIFE": "✨",
+    "R-ORDER": "🧩",
+    "ERRAND": "🏃",
+    "FIN": "💰",
+    "KITCH": "🍽️",
+    "ENDUR": "💪",
+    "CARE": "🐾",
+    "VITAL": "⚡",
+    "FIX": "🔧",
+    "CREAT": "🎨",
+}
+
+# Чтобы сортировать по эмблемам — список ключей
+TOKEN_LIST = list(TOKEN_EMOJI.keys())
 
 
 # =========================
@@ -62,6 +95,7 @@ def get_user(user_id: int) -> dict:
             "tokens": {},
             "rp": 0,
             "bp_level": 0,
+            "search_mode": None,  # task_search / reward_search
         }
     return USERS[uid]
 
@@ -77,18 +111,59 @@ def get_token_balance_text(user_id: int) -> str:
     user = get_user(user_id)
     tdict = user.get("tokens", {})
     if not tdict:
-        return "Пока нет жетонов."
+        return "Пока нет эмблем."
     lines = []
     for token, count in sorted(tdict.items()):
-        lines.append(f"{token}: {count}")
+        emoji = TOKEN_EMOJI.get(token, "🔸")
+        lines.append(f"{emoji} — {count}")
     return "\n".join(lines)
+
+
+def format_task_tokens_award(tokens: list[str]) -> str:
+    """Эмблемы за задачу: 💧×2 🧼"""
+    if not tokens:
+        return "нет"
+    c = Counter(tokens)
+    parts = []
+    for token, cnt in c.items():
+        emoji = TOKEN_EMOJI.get(token, "🔸")
+        if cnt > 1:
+            parts.append(f"{emoji}×{cnt}")
+        else:
+            parts.append(f"{emoji}")
+    return " ".join(parts)
+
+
+def format_token_balance_for_user(user_id: int, token: str, required: int) -> str:
+    """Для крафта: ✅💧5/5 или ▫️💧3/10"""
+    user = get_user(user_id)
+    have = user.get("tokens", {}).get(token, 0)
+    emoji = TOKEN_EMOJI.get(token, "🔸")
+    if have >= required:
+        return f"✅{emoji}{have}/{required}"
+    else:
+        return f"▫️{emoji}{have}/{required}"
+
+
+def get_season_countdown_text() -> str:
+    now = datetime.now()
+    delta = SEASON_END - now
+    days = delta.days
+    if days <= 0:
+        return "Сезон завершён."
+    weeks = days // 7
+    rem_days = days % 7
+    parts = []
+    if weeks > 0:
+        parts.append(f"{weeks} нед.")
+    if rem_days > 0:
+        parts.append(f"{rem_days} дн.")
+    return "До конца сезона: " + " ".join(parts)
 
 
 # =========================
 # Battle Pass
 # =========================
-
-RP_PER_LEVEL = 5  # сколько RP нужно для 1 уровня BP
 
 BATTLE_PASS = {
     1: {"tokens": {"HYDR": 1}},
@@ -174,11 +249,17 @@ async def apply_bp_reward(bot: Bot, user_id: int, level: int):
                 toks.append(k)
         add_tokens(user_id, toks)
 
+        pretty = []
+        for token, v in tokens_dict.items():
+            emoji = TOKEN_EMOJI.get(token, "🔸")
+            if v > 1:
+                pretty.append(f"{emoji}×{v}")
+            else:
+                pretty.append(f"{emoji}")
         await bot.send_message(
             user_id,
             f"🌙 Уровень {level} Battle Pass!\n"
-            f"Получены жетоны: " +
-            ", ".join(f"{k}×{v}" for k, v in tokens_dict.items())
+            f"Эмблемы: {' '.join(pretty)}"
         )
 
     elif "real" in reward:
@@ -1012,18 +1093,39 @@ TASKS = [
     },
 ]
 
+CATEGORIES = {
+    "self": "Про себя / self-care",
+    "home": "Дом",
+    "life": "Жизнь / дела",
+    "mind": "Голова / план",
+    "body": "Тело / движение",
+    "dog": "Собака",
+    "joint": "Совместные",
+    "mtg": "MTG",
+}
+
 
 def get_tasks_by_type(task_type: str):
     return [t for t in TASKS if t["type"] == task_type]
 
 
-def get_random_task(task_type: str):
-    candidates = get_tasks_by_type(task_type)
-    return random.choice(candidates) if candidates else None
+def get_tasks_by_category(category: str):
+    return [t for t in TASKS if t["category"] == category]
+
+
+def get_tasks_by_token(token: str):
+    return [t for t in TASKS if token in t["tokens"]]
+
+
+def get_task_by_id(tid: str):
+    for t in TASKS:
+        if t["id"] == tid:
+            return t
+    return None
 
 
 # =========================
-# КРАФТ НАГРАД — расширенный
+# КРАФТ НАГРАД
 # =========================
 
 REWARDS = [
@@ -1171,7 +1273,7 @@ REWARDS = [
     # LEGENDARY
     {
         "id": "leg_tech",
-        "name": "Крупная техника (до ~150₾)",
+        "name": "Крупная техника",
         "category": "legendary",
         "cost": {"FIN": 3, "FIX": 2, "R-LIFE": 2, "R-ORDER": 1},
         "real": True,
@@ -1207,6 +1309,10 @@ def get_reward_by_id(rid: str):
     return None
 
 
+def get_rewards_by_category(cat: str):
+    return [r for r in REWARDS if r["category"] == cat]
+
+
 def user_can_afford(user_id: int, reward: dict) -> bool:
     user = get_user(user_id)
     tdict = user.get("tokens", {})
@@ -1230,9 +1336,10 @@ def spend_tokens(user_id: int, reward: dict):
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✨ Ежедневки", callback_data="menu_daily")],
+            [InlineKeyboardButton(text="✨ Задачи", callback_data="menu_daily")],
             [InlineKeyboardButton(text="⚗️ Крафт наград", callback_data="menu_craft")],
             [InlineKeyboardButton(text="🌙 Сезон", callback_data="menu_season")],
+            [InlineKeyboardButton(text="🎁 Награды батл-паса", callback_data="bp_rewards")],
             [InlineKeyboardButton(text="💞 Совместные", callback_data="menu_joint")],
             [InlineKeyboardButton(text="🃏 MTG", callback_data="menu_mtg")],
             [InlineKeyboardButton(text="⚙️ Профиль", callback_data="menu_profile")],
@@ -1244,16 +1351,63 @@ def daily_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Лёгкая", callback_data="daily_easy"),
-                InlineKeyboardButton(text="Средняя", callback_data="daily_medium"),
+                InlineKeyboardButton(text="По сложности", callback_data="daily_by_type"),
             ],
             [
-                InlineKeyboardButton(text="Тяжёлая", callback_data="daily_hard"),
-                InlineKeyboardButton(text="Эпическая", callback_data="daily_epic"),
+                InlineKeyboardButton(text="По категориям", callback_data="daily_by_cat"),
+            ],
+            [
+                InlineKeyboardButton(text="По эмблемам", callback_data="daily_by_token"),
+            ],
+            [
+                InlineKeyboardButton(text="Поиск 🔍", callback_data="daily_search"),
             ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
         ]
     )
+
+
+def daily_type_select_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Лёгкие", callback_data="daily_easy"),
+                InlineKeyboardButton(text="Средние", callback_data="daily_medium"),
+            ],
+            [
+                InlineKeyboardButton(text="Сложные", callback_data="daily_hard"),
+                InlineKeyboardButton(text="Эпические", callback_data="daily_epic"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_daily")],
+        ]
+    )
+
+
+def categories_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for key, label in CATEGORIES.items():
+        rows.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"daily_cat:{key}:0"
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_daily")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def token_filter_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for token in TOKEN_LIST:
+        emoji = TOKEN_EMOJI.get(token, "🔸")
+        rows.append([
+            InlineKeyboardButton(
+                text=emoji,
+                callback_data=f"daily_token:{token}:0"
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_daily")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def task_action_kb(task_id: str) -> InlineKeyboardMarkup:
@@ -1270,18 +1424,18 @@ def task_action_kb(task_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def craft_menu_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=r["name"],
-                callback_data=f"craft:{r['id']}",
-            )
+def craft_root_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Мелкие", callback_data="craft_cat:small:0")],
+            [InlineKeyboardButton(text="Средние", callback_data="craft_cat:medium:0")],
+            [InlineKeyboardButton(text="Крупные", callback_data="craft_cat:large:0")],
+            [InlineKeyboardButton(text="Эпические", callback_data="craft_cat:epic:0")],
+            [InlineKeyboardButton(text="Легендарные", callback_data="craft_cat:legendary:0")],
+            [InlineKeyboardButton(text="Поиск 🔍", callback_data="craft_search")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
         ]
-        for r in REWARDS
-    ]
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    )
 
 
 def joint_menu_kb() -> InlineKeyboardMarkup:
@@ -1306,6 +1460,163 @@ def mtg_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
         ]
     )
+
+
+def task_search_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В задачи", callback_data="menu_daily")]
+        ]
+    )
+
+
+def reward_search_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В крафт", callback_data="menu_craft")]
+        ]
+    )
+
+
+# =========================
+# ВСПОМОГАТЕЛЬНОЕ: список задач / наград с пагинацией
+# =========================
+
+async def show_tasks_list(
+    callback: CallbackQuery,
+    tasks: list[dict],
+    base_cb: str,
+    title: str,
+):
+    """Показывает список задач с постраничной навигацией."""
+    data = callback.data
+    parts = data.split(":")
+    page = int(parts[-1]) if len(parts) > 1 and parts[-1].isdigit() else 0
+
+    per_page = 5
+    total = len(tasks)
+    if total == 0:
+        await callback.answer("Пока нет задач в этой группе.", show_alert=True)
+        return
+
+    total_pages = (total - 1) // per_page + 1
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * per_page
+    end = start + per_page
+    subset = tasks[start:end]
+
+    kb_rows = []
+    for task in subset:
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=task["name"],
+                callback_data=f"task_pick:{task['id']}"
+            )
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"{base_cb}:{page-1}"
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"{base_cb}:{page+1}"
+            )
+        )
+    if nav_row:
+        kb_rows.append(nav_row)
+
+    kb_rows.append(
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_daily")]
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    text = f"{title}\nСтраница {page+1}/{total_pages}"
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+async def show_rewards_category(
+    callback: CallbackQuery,
+    category: str,
+):
+    """Список наград по категории с учётом текущих эмблем."""
+    parts = callback.data.split(":")
+    page = int(parts[-1]) if parts and parts[-1].isdigit() else 0
+    user_id = callback.from_user.id
+
+    rewards = get_rewards_by_category(category)
+    per_page = 5
+    total = len(rewards)
+    if total == 0:
+        await callback.answer("Пока нет наград в этой категории.", show_alert=True)
+        return
+
+    total_pages = (total - 1) // per_page + 1
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * per_page
+    end = start + per_page
+    subset = rewards[start:end]
+
+    kb_rows = []
+    for r in subset:
+        cost_parts = []
+        for token, need in r["cost"].items():
+            cost_parts.append(
+                format_token_balance_for_user(user_id, token, need)
+            )
+        cost_str = " ".join(cost_parts)
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"{r['name']} — {cost_str}",
+                callback_data=f"craft:{r['id']}",
+            )
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"craft_cat:{category}:{page-1}"
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"craft_cat:{category}:{page+1}"
+            )
+        )
+    if nav_row:
+        kb_rows.append(nav_row)
+
+    kb_rows.append(
+        [InlineKeyboardButton(text="⬅️ Категории", callback_data="menu_craft")]
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    cat_name = {
+        "small": "Мелкие",
+        "medium": "Средние",
+        "large": "Крупные",
+        "epic": "Эпические",
+        "legendary": "Легендарные",
+    }.get(category, category)
+
+    text = f"Награды: {cat_name}\nСтраница {page+1}/{total_pages}"
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
 
 # =========================
@@ -1342,13 +1653,13 @@ async def cb_back_main(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu_daily")
 async def cb_menu_daily(callback: CallbackQuery):
-    await callback.message.edit_text("Выбери тип задачи:", reply_markup=daily_menu_kb())
+    await callback.message.edit_text("Как выбрать задачу?", reply_markup=daily_menu_kb())
     await callback.answer()
 
 
 @router.callback_query(F.data == "menu_craft")
 async def cb_menu_craft(callback: CallbackQuery):
-    await callback.message.edit_text("Награды для крафта:", reply_markup=craft_menu_kb())
+    await callback.message.edit_text("Крафт наград:", reply_markup=craft_root_kb())
     await callback.answer()
 
 
@@ -1357,13 +1668,55 @@ async def cb_menu_season(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
     rp = user["rp"]
     bp = user["bp_level"]
+    countdown = get_season_countdown_text()
     text = (
         "🌕 <b>Season of Lunar Archives</b>\n"
         "Тема: фокус, порядок, спокойствие.\n\n"
         f"Уровень: <b>{bp}</b>/50\n"
-        f"RP: <b>{rp}</b>\n\n"
-        "Финальная награда: MTG-набор до $50"
+        f"RP: <b>{rp}</b>\n"
+        f"{countdown}"
     )
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bp_rewards")
+async def cb_bp_rewards(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    bp = user["bp_level"]
+
+    lines = ["🎁 <b>Награды батл-паса</b>"]
+    for lvl in range(1, 51):
+        reward = BATTLE_PASS.get(lvl, {})
+        if "tokens" in reward:
+            parts = []
+            for token, amt in reward["tokens"].items():
+                emoji = TOKEN_EMOJI.get(token, "🔸")
+                if amt > 1:
+                    parts.append(f"{emoji}×{amt}")
+                else:
+                    parts.append(emoji)
+            reward_text = "Эмблемы: " + " ".join(parts)
+        elif "real" in reward:
+            reward_text = "🎁 " + reward["real"]
+        else:
+            reward_text = "—"
+
+        base = f"Ур. {lvl}: {reward_text} — {RP_PER_LEVEL} RP"
+
+        # зачёркиваем уже полученное
+        if lvl <= bp and reward_text != "—":
+            line = f"<s>{base}</s>"
+        else:
+            line = base
+
+        # стрелочка на текущем уровне
+        if lvl == bp:
+            line = "➡️ " + line
+
+        lines.append(line)
+
+    text = "\n".join(lines)
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
     await callback.answer()
 
@@ -1397,46 +1750,135 @@ async def cb_menu_profile(callback: CallbackQuery):
         "👤 <b>Профиль</b>\n\n"
         f"RP: <b>{rp}</b>\n"
         f"Уровень BP: <b>{bp}</b>/50\n\n"
-        f"Жетоны:\n{tokens_text}"
+        f"Эмблемы:\n{tokens_text}"
     )
 
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
     await callback.answer()
 
 
-# ---------- DAILY TASKS ----------
+# ---------- DAILY: ВЫБОР СПОСОБА ----------
 
-@router.callback_query(F.data.in_({
-    "daily_easy", "daily_medium", "daily_hard", "daily_epic"
-}))
-async def cb_choose_task(callback: CallbackQuery):
-    mapping = {
-        "daily_easy": "easy",
-        "daily_medium": "medium",
-        "daily_hard": "hard",
-        "daily_epic": "epic",
-    }
-    ttype = mapping[callback.data]
+@router.callback_query(F.data == "daily_by_type")
+async def cb_daily_by_type(callback: CallbackQuery):
+    await callback.message.edit_text("Выбери сложность:", reply_markup=daily_type_select_kb())
+    await callback.answer()
 
-    task = get_random_task(ttype)
-    if not task:
-        await callback.answer("Нет задач этого типа.", show_alert=True)
+
+@router.callback_query(F.data == "daily_by_cat")
+async def cb_daily_by_cat(callback: CallbackQuery):
+    await callback.message.edit_text("Выбери категорию:", reply_markup=categories_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "daily_by_token")
+async def cb_daily_by_token(callback: CallbackQuery):
+    await callback.message.edit_text("Выбери эмблему:", reply_markup=token_filter_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "daily_search")
+async def cb_daily_search(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    user["search_mode"] = "task_search"
+    save_users(USERS)
+
+    await callback.message.edit_text(
+        "🔍 Введи часть названия задачи (например: «кухню», «прогулка», «mtg»).\n"
+        "Я покажу список подходящих задач.",
+        reply_markup=task_search_back_kb(),
+    )
+    await callback.answer()
+
+
+# ---------- DAILY: СПИСОК ПО СЛОЖНОСТИ ----------
+
+@router.callback_query(F.data.startswith("daily_easy"))
+async def cb_daily_easy(callback: CallbackQuery):
+    tasks = get_tasks_by_type("easy")
+    await show_tasks_list(callback, tasks, "daily_easy", "Лёгкие задачи")
+
+
+@router.callback_query(F.data.startswith("daily_medium"))
+async def cb_daily_medium(callback: CallbackQuery):
+    tasks = get_tasks_by_type("medium")
+    await show_tasks_list(callback, tasks, "daily_medium", "Средние задачи")
+
+
+@router.callback_query(F.data.startswith("daily_hard"))
+async def cb_daily_hard(callback: CallbackQuery):
+    tasks = get_tasks_by_type("hard")
+    await show_tasks_list(callback, tasks, "daily_hard", "Сложные задачи")
+
+
+@router.callback_query(F.data.startswith("daily_epic"))
+async def cb_daily_epic(callback: CallbackQuery):
+    tasks = get_tasks_by_type("epic")
+    await show_tasks_list(callback, tasks, "daily_epic", "Эпические задачи")
+
+
+# ---------- DAILY: СПИСОК ПО КАТЕГОРИИ ----------
+
+@router.callback_query(F.data.startswith("daily_cat:"))
+async def cb_daily_cat(callback: CallbackQuery):
+    # format: daily_cat:<category>:<page>
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Ошибка категории.", show_alert=True)
+        return
+    cat = parts[1]
+    if cat not in CATEGORIES:
+        await callback.answer("Неизвестная категория.", show_alert=True)
         return
 
-    text = f"Задача:\n<b>{task['name']}</b>"
+    tasks = get_tasks_by_category(cat)
+    base_cb = f"daily_cat:{cat}"
+    title = f"Задачи категории: {CATEGORIES[cat]}"
+    await show_tasks_list(callback, tasks, base_cb, title)
+
+
+# ---------- DAILY: СПИСОК ПО ЭМБЛЕМАМ ----------
+
+@router.callback_query(F.data.startswith("daily_token:"))
+async def cb_daily_token(callback: CallbackQuery):
+    # format: daily_token:<token>:<page>
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Ошибка эмблемы.", show_alert=True)
+        return
+    token = parts[1]
+    emoji = TOKEN_EMOJI.get(token, "🔸")
+
+    tasks = get_tasks_by_token(token)
+    base_cb = f"daily_token:{token}"
+    title = f"Задачи с эмблемой {emoji}"
+    await show_tasks_list(callback, tasks, base_cb, title)
+
+
+# ---------- DAILY: ВЫБОР КОНКРЕТНОЙ ЗАДАЧИ ----------
+
+@router.callback_query(F.data.startswith("task_pick:"))
+async def cb_task_pick(callback: CallbackQuery):
+    tid = callback.data.split(":", 1)[1]
+    task = get_task_by_id(tid)
+    if not task:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+
+    tokens_str = format_task_tokens_award(task["tokens"])
+    text = (
+        f"Задача:\n<b>{task['name']}</b>\n\n"
+        f"Сложность: {task['type']}\n"
+        f"Категория: {CATEGORIES.get(task['category'], task['category'])}\n"
+        f"Опыт: {task['rp']} RP\n"
+        f"Эмблемы: {tokens_str}"
+    )
     await callback.message.edit_text(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=task_action_kb(task["id"]),
     )
     await callback.answer()
-
-
-def get_task_by_id(tid: str):
-    for t in TASKS:
-        if t["id"] == tid:
-            return t
-    return None
 
 
 @router.callback_query(F.data.startswith("task_done:"))
@@ -1451,11 +1893,11 @@ async def cb_task_done(callback: CallbackQuery, bot: Bot):
     add_tokens(user_id, task["tokens"])
     await add_rp_and_check_bp(bot, user_id, task["rp"])
 
-    tokens_text = ", ".join(task["tokens"])
+    tokens_text = format_task_tokens_award(task["tokens"])
     text = (
         f"✅ Задача выполнена:\n<b>{task['name']}</b>\n\n"
         f"+{task['rp']} RP\n"
-        f"Жетоны: {tokens_text}"
+        f"Эмблемы: {tokens_text}"
     )
     await callback.message.edit_text(
         text,
@@ -1463,6 +1905,115 @@ async def cb_task_done(callback: CallbackQuery, bot: Bot):
         reply_markup=daily_menu_kb(),
     )
     await callback.answer("Готово!")
+
+
+# ---------- ПОИСК ЗАДАЧ / НАГРАД ПО ТЕКСТУ ----------
+
+@router.message(F.text)
+async def handle_text(message: Message):
+    user = get_user(message.from_user.id)
+    mode = user.get("search_mode")
+
+    # ---- поиск задач ----
+    if mode == "task_search":
+        query = (message.text or "").strip().lower()
+        if not query:
+            await message.answer("Введи часть названия задачи, пожалуйста.")
+            return
+
+        user["search_mode"] = None
+        save_users(USERS)
+
+        results = [
+            t for t in TASKS
+            if query in t["name"].lower()
+        ]
+
+        if not results:
+            await message.answer(
+                "Ничего не нашлось.\n"
+                "Попробуй другое слово или зайди в список задач.",
+                reply_markup=task_search_back_kb(),
+            )
+            return
+
+        results = results[:10]
+
+        kb_rows = [
+            [
+                InlineKeyboardButton(
+                    text=t["name"],
+                    callback_data=f"task_pick:{t['id']}"
+                )
+            ]
+            for t in results
+        ]
+        kb_rows.append(
+            [InlineKeyboardButton(text="⬅️ В задачи", callback_data="menu_daily")]
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+        await message.answer(
+            "Вот что нашлось:",
+            reply_markup=kb,
+        )
+        return
+
+    # ---- поиск наград ----
+    if mode == "reward_search":
+        query = (message.text or "").strip().lower()
+        if not query:
+            await message.answer("Введи часть названия награды, пожалуйста.")
+            return
+
+        user["search_mode"] = None
+        save_users(USERS)
+
+        results = [
+            r for r in REWARDS
+            if query in r["name"].lower()
+        ]
+
+        if not results:
+            await message.answer(
+                "Ничего не нашлось.\n"
+                "Попробуй другое слово или зайди в крафт.",
+                reply_markup=reward_search_back_kb(),
+            )
+            return
+
+        results = results[:10]
+        uid = message.from_user.id
+
+        kb_rows = []
+        for r in results:
+            cost_parts = []
+            for token, need in r["cost"].items():
+                cost_parts.append(
+                    format_token_balance_for_user(uid, token, need)
+                )
+            cost_str = " ".join(cost_parts)
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=f"{r['name']} — {cost_str}",
+                    callback_data=f"craft:{r['id']}",
+                )
+            ])
+
+        kb_rows.append(
+            [InlineKeyboardButton(text="⬅️ В крафт", callback_data="menu_craft")]
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        await message.answer(
+            "Награды, которые я нашла:",
+            reply_markup=kb,
+        )
+        return
+
+    # если не в режиме поиска — игнорим текст (бот-компаньон, не чат-бот)
+    return
 
 
 # ---------- JOINT TASKS ----------
@@ -1478,10 +2029,10 @@ async def cb_joint_easy(callback: CallbackQuery, bot: Bot):
     add_tokens(user_id, task["tokens"])
     await add_rp_and_check_bp(bot, user_id, task["rp"])
 
-    toks = ", ".join(task["tokens"])
+    toks = format_task_tokens_award(task["tokens"])
     text = (
         f"💞 Совместный лёгкий квест:\n<b>{task['name']}</b>\n\n"
-        f"+{task['rp']} RP\nЖетоны: {toks}"
+        f"+{task['rp']} RP\nЭмблемы: {toks}"
     )
 
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=joint_menu_kb())
@@ -1499,17 +2050,17 @@ async def cb_joint_cozy(callback: CallbackQuery, bot: Bot):
     add_tokens(user_id, task["tokens"])
     await add_rp_and_check_bp(bot, user_id, task["rp"])
 
-    toks = ", ".join(task["tokens"])
+    toks = format_task_tokens_award(task["tokens"])
     text = (
         f"💞 Уютный вечер-квест:\n<b>{task['name']}</b>\n\n"
-        f"+{task['rp']} RP\nЖетоны: {toks}"
+        f"+{task['rp']} RP\nЭмблемы: {toks}"
     )
 
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=joint_menu_kb())
     await callback.answer("Записано ✨")
 
 
-# ---------- MTG TASKS ----------
+# ---------- MTG TASKS (быстрые кнопки) ----------
 
 @router.callback_query(F.data == "mtg_small")
 async def cb_mtg_small(callback: CallbackQuery, bot: Bot):
@@ -1522,10 +2073,10 @@ async def cb_mtg_small(callback: CallbackQuery, bot: Bot):
     add_tokens(user_id, task["tokens"])
     await add_rp_and_check_bp(bot, user_id, task["rp"])
 
-    toks = ", ".join(task["tokens"])
+    toks = format_task_tokens_award(task["tokens"])
     text = (
         f"🃏 MTG-квест:\n<b>{task['name']}</b>\n\n"
-        f"+{task['rp']} RP\nЖетоны: {toks}"
+        f"+{task['rp']} RP\nЭмблемы: {toks}"
     )
 
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=mtg_menu_kb())
@@ -1543,10 +2094,10 @@ async def cb_mtg_org(callback: CallbackQuery, bot: Bot):
     add_tokens(user_id, task["tokens"])
     await add_rp_and_check_bp(bot, user_id, task["rp"])
 
-    toks = ", ".join(task["tokens"])
+    toks = format_task_tokens_award(task["tokens"])
     text = (
         f"🃏 MTG-организация:\n<b>{task['name']}</b>\n\n"
-        f"+{task['rp']} RP\nЖетоны: {toks}"
+        f"+{task['rp']} RP\nЭмблемы: {toks}"
     )
 
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=mtg_menu_kb())
@@ -1554,6 +2105,31 @@ async def cb_mtg_org(callback: CallbackQuery, bot: Bot):
 
 
 # ---------- CRAFT ----------
+
+@router.callback_query(F.data.startswith("craft_cat:"))
+async def cb_craft_cat(callback: CallbackQuery):
+    # craft_cat:<category>:<page>
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer("Ошибка категории.", show_alert=True)
+        return
+    cat = parts[1]
+    await show_rewards_category(callback, cat)
+
+
+@router.callback_query(F.data == "craft_search")
+async def cb_craft_search(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    user["search_mode"] = "reward_search"
+    save_users(USERS)
+
+    await callback.message.edit_text(
+        "🔍 Введи часть названия награды.\n"
+        "Например: «mtg», «игра», «техника», «доставка».",
+        reply_markup=reward_search_back_kb(),
+    )
+    await callback.answer()
+
 
 @router.callback_query(F.data.startswith("craft:"))
 async def cb_craft(callback: CallbackQuery, bot: Bot):
@@ -1565,7 +2141,7 @@ async def cb_craft(callback: CallbackQuery, bot: Bot):
 
     user_id = callback.from_user.id
     if not user_can_afford(user_id, reward):
-        await callback.answer("Не хватает жетонов.", show_alert=True)
+        await callback.answer("Не хватает эмблем для этой награды.", show_alert=True)
         return
 
     spend_tokens(user_id, reward)
@@ -1585,7 +2161,7 @@ async def cb_craft(callback: CallbackQuery, bot: Bot):
     else:
         text = f"✨ Награда создана: <b>{reward['name']}</b>"
 
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=craft_menu_kb())
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=craft_root_kb())
     await callback.answer("Награда зафиксирована!")
 
 
